@@ -3,7 +3,7 @@
 # Configuration
 LUKS_MAPPER_NAME="glitch_luks"
 TARGET_MOUNT="/mnt/glitch_install"
-SQUASHFS_IMAGE="/run/live/medium/live/filesystem.squashfs"  # Update this path to your SquashFS image
+SQUASHFS_PATH="/run/live/medium/live/filesystem.squashfs"
 
 # Required dependencies
 DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin grub-efi-amd64-bin parted squashfs-tools dosfstools mtools pv"
@@ -11,6 +11,12 @@ DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin g
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root!" >&2
+    exit 1
+fi
+
+# Check if squashfs file exists
+if [ ! -f "$SQUASHFS_PATH" ]; then
+    echo "SquashFS file not found at $SQUASHFS_PATH!" >&2
     exit 1
 fi
 
@@ -390,38 +396,6 @@ partition_disk() {
     fi
 }
 
-install_system() {
-    local target_root="$1"
-    
-    # Check if SquashFS image exists
-    if [ ! -f "$SQUASHFS_IMAGE" ]; then
-        echo "ERROR: SquashFS image not found at $SQUASHFS_IMAGE" >&2
-        exit 1
-    fi
-    
-    echo "Installing system from SquashFS image..."
-    
-    # Create temporary directory for unsquashing
-    TEMP_DIR=$(mktemp -d)
-    
-    # Unsquash the filesystem
-    echo "Extracting SquashFS image..."
-    if ! unsquashfs -f -d "$TEMP_DIR" "$SQUASHFS_IMAGE"; then
-        echo "Failed to extract SquashFS image!" >&2
-        rm -rf "$TEMP_DIR"
-        exit 1
-    fi
-    
-    # Copy files to target
-    echo "Copying files to target..."
-    cp -a "$TEMP_DIR"/* "$target_root"/
-    
-    # Clean up temporary directory
-    rm -rf "$TEMP_DIR"
-    
-    echo "System installation complete."
-}
-
 main_install() {
     # List available disks
     echo -e "\nAvailable disks:"
@@ -453,8 +427,20 @@ main_install() {
     mkdir -p "${TARGET_MOUNT}/boot/efi"
     mount "$EFI_PART" "${TARGET_MOUNT}/boot/efi"
     
-    # Install system from SquashFS
-    install_system "$TARGET_MOUNT"
+    # Install system using unsquashfs
+    echo -e "\nInstalling system from SquashFS..."
+    echo "Extracting filesystem to target..."
+    
+    # Calculate total size for progress bar
+    TOTAL_SIZE=$(unsquashfs -s "$SQUASHFS_PATH" | grep "Filesystem size" | awk '{print $3}')
+    
+    # Extract with progress
+    (
+        cd "$TARGET_MOUNT"
+        unsquashfs -f -d . "$SQUASHFS_PATH" | \
+            pv -s "$TOTAL_SIZE" -n | \
+            while read -r line; do :; done
+    )
     
     configure_system_files "$TARGET_MOUNT" "$TARGET_DEVICE"
     prepare_chroot "$TARGET_MOUNT" "$TARGET_DEVICE"
