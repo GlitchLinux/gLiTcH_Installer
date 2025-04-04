@@ -6,7 +6,7 @@ TARGET_MOUNT="/mnt/glitch_install"
 EXCLUDE_FILE="/tmp/rsync_excludes.txt"
 
 # Required dependencies
-DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin grub-efi-amd64-bin parted rsync dosfstools mtools pv zenity"
+DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-efi-amd64-bin parted rsync dosfstools mtools pv zenity"
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -314,11 +314,6 @@ echo "127.0.1.1 glitch" >> /etc/hosts
 echo "Installing required packages..."
 apt-get update
 [ "$ENCRYPTED" = "yes" ] && apt-get install -y cryptsetup-initramfs cryptsetup
-
-# Reinstall the latest kernel to ensure proper boot files
-echo "Reinstalling kernel..."
-KERNEL_PKG=\$(dpkg -l | grep '^ii.*linux-image' | awk '{print \$2}' | sort -V | tail -n1)
-apt-get install --reinstall -y \$KERNEL_PKG
 
 # First update initramfs with proper mounts available
 echo "Updating initramfs..."
