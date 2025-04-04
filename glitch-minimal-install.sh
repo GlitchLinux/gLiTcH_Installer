@@ -8,6 +8,11 @@ MINIMAL_PACKAGES="systemd,udev,dbus,logrotate,bash,coreutils,util-linux,findutil
 # Required dependencies
 DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin grub-efi-amd64-bin parted rsync dosfstools mtools pv debootstrap"
 
+# Global variables for partition paths
+EFI_PART=""
+ROOT_PART=""
+ENCRYPTED="no"
+
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root!" >&2
@@ -240,15 +245,21 @@ EOF
 
     # Create fstab
     echo "Creating /etc/fstab..."
+    local efi_fs_uuid=$(get_uuid "$EFI_PART")
+    
     if [ "$ENCRYPTED" = "yes" ]; then
+        local root_fs_uuid=$(get_uuid "/dev/mapper/$LUKS_MAPPER_NAME")
         cat > "${target_root}/etc/fstab" << EOF
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
 UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
+UUID=${efi_fs_uuid}  /boot/efi       vfat    umask=0077      0       1
 EOF
     else
+        local root_fs_uuid=$(get_uuid "$ROOT_PART")
         cat > "${target_root}/etc/fstab" << EOF
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
 UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
+UUID=${efi_fs_uuid}  /boot/efi       vfat    umask=0077      0       1
 EOF
     fi
 
@@ -261,6 +272,9 @@ EOF
     
     mkdir -p "${target_root}/boot/grub"
     if [ "$ENCRYPTED" = "yes" ]; then
+        local root_part_uuid=$(get_uuid "$ROOT_PART")
+        local root_fs_uuid=$(get_uuid "/dev/mapper/$LUKS_MAPPER_NAME")
+        
         cat > "${target_root}/boot/grub/grub.cfg" << EOF
 menuentry "Glitch Linux" {
     insmod part_gpt
@@ -287,6 +301,8 @@ menuentry "Glitch Linux (recovery mode)" {
 }
 EOF
     else
+        local root_fs_uuid=$(get_uuid "$ROOT_PART")
+        
         cat > "${target_root}/boot/grub/grub.cfg" << EOF
 menuentry "Glitch Linux" {
     insmod part_gpt
@@ -343,6 +359,14 @@ fi
 echo "Updating initramfs..."
 update-initramfs -u -k all
 
+# Enable cryptodisk
+echo "grub-cryptodisk enable = y" >> /etc/default/grub
+
+# Install GRUB packages
+echo "Installing GRUB EFI packages..."
+apt-get update
+apt-get install -y grub-efi
+
 # Install GRUB
 echo "Installing GRUB..."
 if [ -d "/sys/firmware/efi" ]; then
@@ -351,6 +375,8 @@ else
     grub-install ${target_device} --recheck
 fi
 
+# Update GRUB
+echo "Updating GRUB configuration..."
 update-grub
 
 # Clean up
@@ -389,7 +415,7 @@ partition_disk() {
     partprobe "$target_device"
     sleep 2
     
-    # Determine partition paths
+    # Determine partition paths - use global variables
     if [[ "$target_device" =~ "nvme" ]]; then
         EFI_PART="${target_device}p1"
         ROOT_PART="${target_device}p2"
@@ -397,6 +423,10 @@ partition_disk() {
         EFI_PART="${target_device}1"
         ROOT_PART="${target_device}2"
     fi
+    
+    echo "Created partitions:"
+    echo "  EFI: $EFI_PART"
+    echo "  ROOT: $ROOT_PART"
     
     # Format partitions
     echo "Formatting partitions..."
@@ -412,6 +442,41 @@ partition_disk() {
     fi
 }
 
+post_installation_steps() {
+    local target_root="$1"
+    
+    echo "Running post-installation steps..."
+    
+    # Create post-installation script
+    cat > "${target_root}/post_install.sh" << EOF
+#!/bin/sh
+# Enable cryptodisk
+echo "grub-cryptodisk enable = y" >> /etc/default/grub
+
+# Update and install GRUB EFI
+apt update && apt install -y grub-efi
+
+# Install GRUB to the EFI partition
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck --removable
+
+# Update GRUB configuration
+update-grub
+
+# Clean up
+rm -f /post_install.sh
+EOF
+
+    chmod +x "${target_root}/post_install.sh"
+    
+    # Execute post-installation script in chroot
+    echo "Executing post-installation script..."
+    if ! chroot "${target_root}" /bin/sh -c "/post_install.sh"; then
+        echo "Post-installation steps failed!" >&2
+        exit 1
+    fi
+    echo "Post-installation steps completed successfully!"
+}
+
 main_install() {
     # List available disks
     echo -e "\nAvailable disks:"
@@ -424,8 +489,8 @@ main_install() {
     [ "$CONFIRM" != "yes" ] && exit 0
     
     # Ask for encryption
-    read -p "Enable disk encryption? (yes/no) [default: yes]: " ENCRYPTED
-    ENCRYPTED=${ENCRYPTED:-yes}
+    read -p "Enable disk encryption? (yes/no) [default: yes]: " ENCRYPT_CHOICE
+    ENCRYPTED=${ENCRYPT_CHOICE:-yes}
     
     # Partition and format disk
     partition_disk "$TARGET_DEVICE"
@@ -451,6 +516,9 @@ main_install() {
     
     # Prepare chroot and install bootloader
     prepare_chroot "$TARGET_MOUNT" "$TARGET_DEVICE"
+    
+    # Run post-installation steps
+    post_installation_steps "$TARGET_MOUNT"
     
     echo -e "\nInstallation complete!"
     echo "You may now reboot into your new system."
