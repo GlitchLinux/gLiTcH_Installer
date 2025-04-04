@@ -3,20 +3,14 @@
 # Configuration
 LUKS_MAPPER_NAME="glitch_luks"
 TARGET_MOUNT="/mnt/glitch_install"
-SQUASHFS_PATH="/run/live/medium/live/filesystem.squashfs"
+EXCLUDE_FILE="/tmp/rsync_excludes.txt"
 
 # Required dependencies
-DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin grub-efi-amd64-bin parted squashfs-tools dosfstools mtools pv"
+DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-pc-bin grub-efi-amd64-bin parted rsync dosfstools mtools pv"
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root!" >&2
-    exit 1
-fi
-
-# Check if squashfs file exists
-if [ ! -f "$SQUASHFS_PATH" ]; then
-    echo "SquashFS file not found at $SQUASHFS_PATH!" >&2
     exit 1
 fi
 
@@ -60,6 +54,9 @@ cleanup() {
                 cryptsetup close "$LUKS_MAPPER_NAME"
             fi
             
+            # Remove temp files
+            [ -f "$EXCLUDE_FILE" ] && rm -f "$EXCLUDE_FILE"
+            
             # Remove mount point if empty
             [ -d "$TARGET_MOUNT" ] && rmdir "$TARGET_MOUNT" 2>/dev/null
             ;;
@@ -71,15 +68,37 @@ cleanup() {
 
 trap cleanup EXIT
 
+create_exclude_file() {
+    cat > "$EXCLUDE_FILE" << EOF
+/dev/*
+/proc/*
+/sys/*
+/run/*
+/tmp/*
+/lost+found
+/mnt/*
+/media/*
+/var/cache/*
+/var/tmp/*
+${TARGET_MOUNT}/*
+/boot/*
+EOF
+}
+
 find_kernel_initrd() {
     local target_root="$1"
     
-    KERNEL_VERSION=$(ls -1 "${target_root}/boot" | grep -E "vmlinuz-[0-9]" | sort -V | tail -n1 | sed 's/vmlinuz-//')
-    [ -z "$KERNEL_VERSION" ] && { echo "ERROR: Kernel not found!" >&2; exit 1; }
+    # Find the newest kernel package installed
+    KERNEL_PKG=$(dpkg -l | grep '^ii.*linux-image' | awk '{print $2}' | sort -V | tail -n1)
+    [ -z "$KERNEL_PKG" ] && { echo "ERROR: No kernel package found!" >&2; exit 1; }
     
+    # Extract the version number
+    KERNEL_VERSION=$(echo "$KERNEL_PKG" | sed 's/linux-image-//')
+    
+    # Find the corresponding initrd
     INITRD=""
     for pattern in "initrd.img-${KERNEL_VERSION}" "initramfs-${KERNEL_VERSION}.img" "initrd-${KERNEL_VERSION}.gz"; do
-        [ -f "${target_root}/boot/${pattern}" ] && INITRD="$pattern" && break
+        [ -f "/boot/${pattern}" ] && INITRD="$pattern" && break
     done
     [ -z "$INITRD" ] && { echo "ERROR: Initrd not found for kernel ${KERNEL_VERSION}" >&2; exit 1; }
     
@@ -96,6 +115,16 @@ configure_system_files() {
     local target_root="$1"
     local target_device="$2"
     
+    # Create clean /boot directory structure
+    echo "Creating clean /boot directory..."
+    mkdir -p "${target_root}/boot/grub"
+    
+    # Copy only the necessary kernel and initrd files
+    find_kernel_initrd "$target_root"
+    echo "Copying kernel and initrd to target..."
+    cp "/boot/vmlinuz-${KERNEL_VERSION}" "${target_root}/boot/"
+    cp "/boot/${INITRD}" "${target_root}/boot/"
+    
     if [ "$ENCRYPTED" = "yes" ]; then
         # Get actual UUIDs from the system for encrypted setup
         local root_part_uuid=$(get_uuid "$ROOT_PART")
@@ -105,12 +134,6 @@ configure_system_files() {
             echo "ERROR: Failed to get UUIDs for partitions!" >&2
             exit 1
         fi
-
-        # Verify UUIDs are correct
-        echo "Verifying UUIDs:"
-        echo "- Partition UUID: ${root_part_uuid}"
-        echo "- Filesystem UUID: ${root_fs_uuid}"
-        lsblk -o NAME,UUID | grep -E "(${LUKS_MAPPER_NAME}|${ROOT_PART##*/})"
 
         # Create /etc/crypttab
         echo "Creating /etc/crypttab..."
@@ -145,39 +168,13 @@ UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
 EOF
 
         # Update GRUB configuration
-        echo "Updating GRUB configuration..."
-        find_kernel_initrd "$target_root"
-        
-        # Ensure GRUB cryptodisk support is enabled
-        echo "Configuring GRUB_ENABLE_CRYPTODISK..."
+        echo "Configuring GRUB..."
         mkdir -p "${target_root}/etc/default"
-        if [ -f "${target_root}/etc/default/grub" ]; then
-            sed -i 's/^GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/' "${target_root}/etc/default/grub"
-        fi
-        if ! grep -q '^GRUB_ENABLE_CRYPTODISK=y' "${target_root}/etc/default/grub"; then
-            echo "GRUB_ENABLE_CRYPTODISK=y" >> "${target_root}/etc/default/grub"
-        fi
+        echo "GRUB_ENABLE_CRYPTODISK=y" > "${target_root}/etc/default/grub"
         
-        mkdir -p "${target_root}/boot/grub"
+        # Create minimal grub.cfg that will be replaced during chroot
         cat > "${target_root}/boot/grub/grub.cfg" << EOF
-loadfont /usr/share/grub/unicode.pf2
-
-set gfxmode=640x480
-load_video
-insmod gfxterm
-set locale_dir=/boot/grub/locale
-set lang=C
-insmod gettext
-background_image -m stretch /boot/grub/grub.png
-terminal_output gfxterm
-insmod png
-if background_image /boot/grub/grub.png; then
-    true
-else
-    set menu_color_normal=cyan/blue
-    set menu_color_highlight=white/blue
-fi
-
+set timeout=5
 menuentry "Glitch Linux" {
     insmod part_gpt
     insmod cryptodisk
@@ -188,19 +185,6 @@ menuentry "Glitch Linux" {
     set root='(crypto0)'
     search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
     linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} cryptdevice=UUID=${root_part_uuid}:${LUKS_MAPPER_NAME} ro quiet
-    initrd /boot/${INITRD}
-}
-
-menuentry "Glitch Linux (recovery mode)" {
-    insmod part_gpt
-    insmod cryptodisk
-    insmod luks
-    insmod ext2
-    
-    cryptomount -u ${root_part_uuid}
-    set root='(crypto0)'
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} cryptdevice=UUID=${root_part_uuid}:${LUKS_MAPPER_NAME} ro single
     initrd /boot/${INITRD}
 }
 EOF
@@ -220,30 +204,9 @@ EOF
 UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
 EOF
 
-        # Update GRUB configuration
-        echo "Updating GRUB configuration..."
-        find_kernel_initrd "$target_root"
-        
-        mkdir -p "${target_root}/boot/grub"
+        # Create minimal grub.cfg that will be replaced during chroot
         cat > "${target_root}/boot/grub/grub.cfg" << EOF
-loadfont /usr/share/grub/unicode.pf2
-
-set gfxmode=640x480
-load_video
-insmod gfxterm
-set locale_dir=/boot/grub/locale
-set lang=C
-insmod gettext
-background_image -m stretch /boot/grub/grub.png
-terminal_output gfxterm
-insmod png
-if background_image /boot/grub/grub.png; then
-    true
-else
-    set menu_color_normal=cyan/blue
-    set menu_color_highlight=white/blue
-fi
-
+set timeout=5
 menuentry "Glitch Linux" {
     insmod part_gpt
     insmod ext2
@@ -252,19 +215,8 @@ menuentry "Glitch Linux" {
     linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} ro quiet
     initrd /boot/${INITRD}
 }
-
-menuentry "Glitch Linux (recovery mode)" {
-    insmod part_gpt
-    insmod ext2
-    
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} ro single
-    initrd /boot/${INITRD}
-}
 EOF
     fi
-
-    echo "Initramfs will be updated after chroot environment is prepared"
 }
 
 prepare_chroot() {
@@ -286,34 +238,38 @@ prepare_chroot() {
 echo "glitch" > /etc/hostname
 echo "127.0.1.1 glitch" >> /etc/hosts
 
-# Install required packages in chroot
-echo "Installing required packages..."
-apt-get update
-[ "$ENCRYPTED" = "yes" ] && apt-get install -y cryptsetup-initramfs cryptsetup
-
-# Reinstall the latest kernel to ensure proper boot files
-echo "Reinstalling kernel..."
+# Install only the latest kernel
+echo "Installing latest kernel..."
 KERNEL_PKG=\$(dpkg -l | grep '^ii.*linux-image' | awk '{print \$2}' | sort -V | tail -n1)
 apt-get install --reinstall -y \$KERNEL_PKG
 
-# First update initramfs with proper mounts available
+# Install GRUB and cryptsetup if needed
+echo "Installing required packages..."
+[ "$ENCRYPTED" = "yes" ] && apt-get install -y cryptsetup-initramfs cryptsetup
+apt-get install -y grub-efi-amd64-bin grub-common
+
+# Update initramfs
 echo "Updating initramfs..."
 update-initramfs -u -k all || { echo "Initramfs update failed"; exit 1; }
 
-# Then install GRUB
+# Install GRUB
 echo "Installing GRUB..."
 if [ -d "/sys/firmware/efi" ]; then
     grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || { echo "EFI GRUB install failed"; exit 1; }
+    
+    # Rename EFI files for better compatibility
+    echo "Renaming EFI files..."
+    mkdir -p /boot/efi/EFI/BOOT
+    cp /boot/efi/EFI/GRUB/grubx64.efi /boot/efi/EFI/BOOT/
+    mv /boot/efi/EFI/BOOT/grubx64.efi /boot/efi/EFI/BOOT/bootx64.efi
+    cp /boot/efi/EFI/GRUB/grubx64.efi /boot/efi/EFI/BOOT/grubx64.efi
 else
     grub-install ${target_device} --recheck || { echo "BIOS GRUB install failed"; exit 1; }
 fi
-update-grub || { echo "GRUB update failed"; exit 1; }
 
-# Verify cryptsetup in initramfs if encrypted
-if [ "$ENCRYPTED" = "yes" ]; then
-    echo "Verifying cryptsetup in initramfs..."
-    lsinitramfs /boot/initrd.img-*\$(uname -r) | grep cryptsetup || echo "Warning: cryptsetup not found in initramfs"
-fi
+# Generate proper GRUB config
+echo "Generating GRUB config..."
+update-grub || { echo "GRUB update failed"; exit 1; }
 
 # Clean up
 rm -f /chroot_prep.sh
@@ -427,20 +383,14 @@ main_install() {
     mkdir -p "${TARGET_MOUNT}/boot/efi"
     mount "$EFI_PART" "${TARGET_MOUNT}/boot/efi"
     
-    # Install system using unsquashfs
-    echo -e "\nInstalling system from SquashFS..."
-    echo "Extracting filesystem to target..."
+    # Install system
+    echo -e "\nInstalling system..."
+    create_exclude_file
     
-    # Calculate total size for progress bar
-    TOTAL_SIZE=$(unsquashfs -s "$SQUASHFS_PATH" | grep "Filesystem size" | awk '{print $3}')
-    
-    # Extract with progress
-    (
-        cd "$TARGET_MOUNT"
-        unsquashfs -f -d . "$SQUASHFS_PATH" | \
-            pv -s "$TOTAL_SIZE" -n | \
-            while read -r line; do :; done
-    )
+    echo -e "\nStarting rsync transfer..."
+    rsync -aAXH --info=progress2 --exclude-from="$EXCLUDE_FILE" \
+          --exclude=/boot/efi --exclude=/boot/grub \
+          / "$TARGET_MOUNT" | pv -pet
     
     configure_system_files "$TARGET_MOUNT" "$TARGET_DEVICE"
     prepare_chroot "$TARGET_MOUNT" "$TARGET_DEVICE"
