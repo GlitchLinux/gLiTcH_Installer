@@ -118,7 +118,7 @@ update_progress() {
     update_progress 15 "Creating partitions..."
     parted -s "$SELECTED_DISK" mkpart EFI-DEB fat32 1MiB 49MiB || show_error "Failed to create EFI partition"
     parted -s "$SELECTED_DISK" set 1 esp on || show_error "Failed to set ESP flag"
-    parted -s "$SELECTED_DISK" mkpart gLiTcH-Linux ext4 51MiB 100% || show_error "Failed to create root partition"
+    parted -s "$SELECTED_DISK" mkpart gLiTcH-Linux ext4 49MiB 100% || show_error "Failed to create root partition"
     sync
     sleep 3
     
