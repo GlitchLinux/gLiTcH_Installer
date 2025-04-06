@@ -1,484 +1,328 @@
 #!/bin/bash
 
-# Configuration
-LUKS_MAPPER_NAME="glitch_luks"
-TARGET_MOUNT="/mnt/glitch_install"
-EXCLUDE_FILE="/tmp/rsync_excludes.txt"
+# gLiTcH System Installer
+# A graphical live installer using Zenity with unsquashfs progress monitoring
 
-# Required dependencies
-DEPENDENCIES="wget cryptsetup-bin cryptsetup-initramfs grub-common grub-efi-amd64-bin parted rsync dosfstools mtools pv zenity"
+# Enable logging
+LOG_FILE="/tmp/glitch-installer.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Starting gLiTcH System Installer..."
+
+# Function to display errors
+show_error() {
+    zenity --error --title="Installation Error" --text="$1\n\nCheck the log file: $LOG_FILE" --width=400
+    exit 1
+}
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
-    zenity --error --title="Permission Error" --text="This script must be run as root!" --width=300
+    zenity --error --title="Error" --text="This script must be run as root (sudo)."
     exit 1
 fi
 
-# Install dependencies
-if ! zenity --question --title="Dependencies" --text="Install required dependencies?\n\n$DEPENDENCIES" --width=400; then
-    zenity --error --title="Aborted" --text="Dependencies are required to continue." --width=300
+# Verify required tools are installed
+for tool in zenity parted mkfs.fat mkfs.ext4 unsquashfs pv; do
+    if ! command -v "$tool" &> /dev/null; then
+        if [ "$tool" = "pv" ]; then
+            zenity --info --title="Missing Tool" --text="The 'pv' tool is not installed. Progress monitoring will be limited.\nConsider installing it with: apt-get install pv" --width=400
+        else
+            show_error "Required tool not found: $tool\nPlease install it and try again."
+        fi
+    fi
+done
+
+# Welcome message
+zenity --info --title="gLiTcH System Installer" --text="Welcome to the gLiTcH Linux installer.\n\nThis will install gLiTcH Linux on your system.\n\nWARNING: This will ERASE ALL DATA on the selected disk!" --width=400
+
+# Get available disks using a more reliable method
+echo "Detecting available disks..."
+TEMP_DISKS_FILE=$(mktemp)
+lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 | grep -v "^fd" > "$TEMP_DISKS_FILE"
+echo "Detected disks:"
+cat "$TEMP_DISKS_FILE"
+
+# Create a temporary file for disk options
+DISK_OPTIONS_FILE=$(mktemp)
+while read -r name size model; do
+    echo "/dev/$name" >> "$DISK_OPTIONS_FILE"
+done < "$TEMP_DISKS_FILE"
+
+# Check if we have any disks
+if [ ! -s "$DISK_OPTIONS_FILE" ]; then
+    show_error "No suitable disks found for installation."
+fi
+
+# Display a simple list of disks
+DISKS=$(cat "$DISK_OPTIONS_FILE")
+echo "Available disks for selection: $DISKS"
+
+# Let user select disk (simplified approach)
+SELECTED_DISK=$(zenity --list --title="Select Disk" --text="Select the disk to install gLiTcH Linux:" \
+    --radiolist --column="Select" --column="Device" \
+    $(for disk in $DISKS; do echo "FALSE $disk"; done | sed 's/FALSE/TRUE/1') \
+    --height=300 --width=300 --hide-header)
+
+if [ -z "$SELECTED_DISK" ]; then
+    zenity --error --title="Error" --text="No disk selected. Installation aborted."
     exit 1
 fi
 
-(
-echo "10" ; sleep 1
-echo "Updating package list..." ; apt update
-echo "30" ; sleep 1
-echo "Installing dependencies..." ; apt install -y $DEPENDENCIES
-echo "100" ; sleep 1
-) | zenity --progress --title="Installing Dependencies" --text="Preparing..." --percentage=0 --auto-close
-
-if [ $? -ne 0 ]; then
-    zenity --error --title="Installation Failed" --text="Failed to install dependencies!" --width=300
-    exit 1
+# Verify selected disk exists
+if [ ! -b "$SELECTED_DISK" ]; then
+    show_error "Selected disk $SELECTED_DISK does not exist or is not a block device."
 fi
 
-# Function to clean up
-cleanup() {
-    choice=$(zenity --list --title="Cleanup Options" --text="Choose cleanup action:" \
-                    --column="Option" --column="Description" \
-                    "Keep mounts" "Keep mounts active for chroot access" \
-                    "Clean up" "Unmount everything and clean up" \
-                    --width=500 --height=200)
-    
-    case "$choice" in
-        "Keep mounts")
-            zenity --info --title="Cleanup" --text="Keeping mounts active. Remember to manually clean up later!\n\nUse: umount -R $TARGET_MOUNT\n$([ "$ENCRYPTED" = "yes" ] && echo "cryptsetup close $LUKS_MAPPER_NAME")" --width=400
-            ;;
-        "Clean up")
-            (
-            echo "20" ; sleep 0.5
-            echo "Unmounting filesystems..." 
-            # Unmount all mounted filesystems
-            for mountpoint in "${TARGET_MOUNT}/boot/efi" "${TARGET_MOUNT}/dev/pts" "${TARGET_MOUNT}/dev" \
-                            "${TARGET_MOUNT}/proc" "${TARGET_MOUNT}/sys" "${TARGET_MOUNT}/run"; do
-                if mountpoint -q "$mountpoint"; then
-                    umount -R "$mountpoint" 2>/dev/null
-                fi
-            done
-            
-            echo "40" ; sleep 0.5
-            # Unmount the main filesystem
-            if mountpoint -q "$TARGET_MOUNT"; then
-                umount -R "$TARGET_MOUNT" 2>/dev/null
-            fi
-            
-            echo "60" ; sleep 0.5
-            # Close LUKS if open
-            if [ "$ENCRYPTED" = "yes" ] && cryptsetup status "$LUKS_MAPPER_NAME" &>/dev/null; then
-                cryptsetup close "$LUKS_MAPPER_NAME"
-            fi
-            
-            echo "80" ; sleep 0.5
-            # Remove temp files
-            [ -f "$EXCLUDE_FILE" ] && rm -f "$EXCLUDE_FILE"
-            
-            # Remove mount point if empty
-            [ -d "$TARGET_MOUNT" ] && rmdir "$TARGET_MOUNT" 2>/dev/null
-            echo "100" ; sleep 0.5
-            ) | zenity --progress --title="Cleaning Up" --text="Cleaning up..." --percentage=0 --auto-close
-            ;;
-        *)
-            zenity --info --title="Cleanup" --text="Keeping mounts active." --width=300
-            ;;
-    esac
+echo "Selected disk: $SELECTED_DISK"
+
+# Display disk information for confirmation
+DISK_INFO=$(lsblk -n -o SIZE,MODEL "$SELECTED_DISK" | head -1)
+if ! zenity --question --title="Confirm Disk Selection" --text="You selected: $SELECTED_DISK ($DISK_INFO)\n\nWARNING: ALL DATA ON THIS DISK WILL BE ERASED!\n\nDo you want to continue?" --width=450; then
+    zenity --info --title="Installation Aborted" --text="Installation has been aborted."
+    exit 0
+fi
+
+# Function to update progress
+update_progress() {
+    local percent="$1"
+    local message="$2"
+    echo "$percent"
+    echo "# $message"
 }
 
-trap cleanup EXIT
-
-create_exclude_file() {
-    cat > "$EXCLUDE_FILE" << EOF
-/dev/*
-/proc/*
-/sys/*
-/run/*
-/tmp/*
-/lost+found
-/mnt/*
-/media/*
-/var/cache/*
-/var/tmp/*
-${TARGET_MOUNT}/*
-EOF
-}
-
-find_kernel_initrd() {
-    local target_root="$1"
+# Initial progress dialog
+{
+    update_progress 0 "Preparing for installation..."
     
-    KERNEL_VERSION=$(ls -1 "${target_root}/boot" | grep -E "vmlinuz-[0-9]" | sort -V | tail -n1 | sed 's/vmlinuz-//')
-    [ -z "$KERNEL_VERSION" ] && { zenity --error --title="Error" --text="Kernel not found!" --width=300; exit 1; }
-    
-    INITRD=""
-    for pattern in "initrd.img-${KERNEL_VERSION}" "initramfs-${KERNEL_VERSION}.img" "initrd-${KERNEL_VERSION}.gz"; do
-        [ -f "${target_root}/boot/${pattern}" ] && INITRD="$pattern" && break
+    # Make sure the disk isn't mounted
+    update_progress 5 "Unmounting any partitions from $SELECTED_DISK..."
+    mounted_parts=$(mount | grep "$SELECTED_DISK" | awk '{print $1}')
+    for part in $mounted_parts; do
+        umount -f "$part" 2>/dev/null || true
     done
-    [ -z "$INITRD" ] && { zenity --error --title="Error" --text="Initrd not found for kernel ${KERNEL_VERSION}" --width=300; exit 1; }
     
-    zenity --info --title="Kernel Found" --text="Found kernel: vmlinuz-${KERNEL_VERSION}\nFound initrd: ${INITRD}" --width=300
-}
-
-get_uuid() {
-    local device="$1"
-    blkid -s UUID -o value "$device"
-}
-
-configure_system_files() {
-    local target_root="$1"
-    local target_device="$2"
+    # Clear partition table using parted
+    update_progress 10 "Creating partition table on $SELECTED_DISK..."
     
-    if [ "$ENCRYPTED" = "yes" ]; then
-        # Get actual UUIDs from the system for encrypted setup
-        local root_part_uuid=$(get_uuid "$ROOT_PART")
-        local root_fs_uuid=$(get_uuid "/dev/mapper/$LUKS_MAPPER_NAME")
-        
-        if [ -z "$root_part_uuid" ] || [ -z "$root_fs_uuid" ]; then
-            zenity --error --title="Error" --text="Failed to get UUIDs for partitions!" --width=300
-            exit 1
-        fi
-
-        # Create /etc/crypttab
-        echo "Creating /etc/crypttab..."
-        cat > "${target_root}/etc/crypttab" << EOF
-${LUKS_MAPPER_NAME} UUID=${root_part_uuid} none luks,discard
-EOF
-
-        # Configure cryptsetup for initramfs
-        echo "Configuring cryptsetup for initramfs..."
-        mkdir -p "${target_root}/etc/initramfs-tools/conf.d"
-        cat > "${target_root}/etc/initramfs-tools/conf.d/cryptsetup" << EOF
-KEYFILE_PATTERN=/etc/luks/*.keyfile
-UMASK=0077
-EOF
-
-        # Add necessary modules to initramfs
-        echo "Adding required modules to initramfs..."
-        cat > "${target_root}/etc/initramfs-tools/modules" << EOF
-dm-crypt
-cryptodisk
-luks
-aes
-sha256
-ext4
-EOF
-
-        # Create /etc/fstab with correct UUIDs
-        echo "Creating /etc/fstab..."
-        cat > "${target_root}/etc/fstab" << EOF
-# <file system> <mount point>   <type>  <options>       <dump>  <pass>
-UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
-EOF
-
-        # Update GRUB configuration
-        echo "Updating GRUB configuration..."
-        find_kernel_initrd "$target_root"
-        
-        # Ensure GRUB cryptodisk support is enabled
-        echo "Configuring GRUB_ENABLE_CRYPTODISK..."
-        mkdir -p "${target_root}/etc/default"
-        if [ -f "${target_root}/etc/default/grub" ]; then
-            sed -i 's/^GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/' "${target_root}/etc/default/grub"
-        fi
-        if ! grep -q '^GRUB_ENABLE_CRYPTODISK=y' "${target_root}/etc/default/grub"; then
-            echo "GRUB_ENABLE_CRYPTODISK=y" >> "${target_root}/etc/default/grub"
-        fi
-        
-        mkdir -p "${target_root}/boot/grub"
-        cat > "${target_root}/boot/grub/grub.cfg" << EOF
-loadfont /usr/share/grub/unicode.pf2
-
-set gfxmode=640x480
-load_video
-insmod gfxterm
-set locale_dir=/boot/grub/locale
-set lang=C
-insmod gettext
-background_image -m stretch /boot/grub/grub.png
-terminal_output gfxterm
-insmod png
-if background_image /boot/grub/grub.png; then
-    true
-else
-    set menu_color_normal=cyan/blue
-    set menu_color_highlight=white/blue
-fi
-
-menuentry "Glitch Linux" {
-    insmod part_gpt
-    insmod cryptodisk
-    insmod luks
-    insmod ext2
+    # Stop any services that might be using the disk
+    systemctl stop udisks2.service 2>/dev/null || true
     
-    cryptomount -u ${root_part_uuid}
-    set root='(crypto0)'
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} cryptdevice=UUID=${root_part_uuid}:${LUKS_MAPPER_NAME} ro quiet
-    initrd /boot/${INITRD}
-}
-
-menuentry "Glitch Linux (recovery mode)" {
-    insmod part_gpt
-    insmod cryptodisk
-    insmod luks
-    insmod ext2
+    # Create new GPT partition table
+    parted -s "$SELECTED_DISK" mklabel gpt || {
+        echo "Failed to create GPT label with parted, retrying with fdisk"
+        echo "g" | fdisk "$SELECTED_DISK" || show_error "Failed to create GPT label"
+    }
+    sync
+    sleep 2
     
-    cryptomount -u ${root_part_uuid}
-    set root='(crypto0)'
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} cryptdevice=UUID=${root_part_uuid}:${LUKS_MAPPER_NAME} ro single
-    initrd /boot/${INITRD}
-}
-EOF
+    # Create partitions using parted
+    update_progress 15 "Creating partitions..."
+    parted -s "$SELECTED_DISK" mkpart EFI-DEB fat32 1MiB 51MiB || show_error "Failed to create EFI partition"
+    parted -s "$SELECTED_DISK" set 1 esp on || show_error "Failed to set ESP flag"
+    parted -s "$SELECTED_DISK" mkpart gLiTcH-Linux ext4 51MiB 100% || show_error "Failed to create root partition"
+    sync
+    sleep 3
+    
+    # Determine partitions based on disk naming convention
+    update_progress 20 "Identifying partitions..."
+    # Force kernel to re-read partition table
+    partprobe "$SELECTED_DISK" || true
+    sleep 2
+    
+    # Get partition names
+    if [[ "$SELECTED_DISK" == *"nvme"* ]] || [[ "$SELECTED_DISK" == *"mmcblk"* ]]; then
+        # For NVMe drives (nvme0n1p1) or MMC devices (mmcblk0p1)
+        EFI_PARTITION="${SELECTED_DISK}p1"
+        ROOT_PARTITION="${SELECTED_DISK}p2"
     else
-        # Unencrypted setup
-        local root_fs_uuid=$(get_uuid "$ROOT_PART")
-        
-        if [ -z "$root_fs_uuid" ]; then
-            zenity --error --title="Error" --text="Failed to get UUID for root partition!" --width=300
-            exit 1
-        fi
-
-        # Create /etc/fstab
-        echo "Creating /etc/fstab..."
-        cat > "${target_root}/etc/fstab" << EOF
-# <file system> <mount point>   <type>  <options>       <dump>  <pass>
-UUID=${root_fs_uuid} /               ext4    errors=remount-ro 0       1
-EOF
-
-        # Update GRUB configuration
-        echo "Updating GRUB configuration..."
-        find_kernel_initrd "$target_root"
-        
-        mkdir -p "${target_root}/boot/grub"
-        cat > "${target_root}/boot/grub/grub.cfg" << EOF
-loadfont /usr/share/grub/unicode.pf2
-
-set gfxmode=640x480
-load_video
-insmod gfxterm
-set locale_dir=/boot/grub/locale
-set lang=C
-insmod gettext
-background_image -m stretch /boot/grub/grub.png
-terminal_output gfxterm
-insmod png
-if background_image /boot/grub/grub.png; then
-    true
-else
-    set menu_color_normal=cyan/blue
-    set menu_color_highlight=white/blue
-fi
-
-menuentry "Glitch Linux" {
-    insmod part_gpt
-    insmod ext2
-    
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} ro quiet
-    initrd /boot/${INITRD}
-}
-
-menuentry "Glitch Linux (recovery mode)" {
-    insmod part_gpt
-    insmod ext2
-    
-    search --no-floppy --fs-uuid --set=root ${root_fs_uuid}
-    linux /boot/vmlinuz-${KERNEL_VERSION} root=UUID=${root_fs_uuid} ro single
-    initrd /boot/${INITRD}
-}
-EOF
+        # For regular disks (sda1, vda1)
+        EFI_PARTITION="${SELECTED_DISK}1"
+        ROOT_PARTITION="${SELECTED_DISK}2"
     fi
-
-    echo "Initramfs will be updated after chroot environment is prepared"
-}
-
-prepare_chroot() {
-    local target_root="$1"
-    local target_device="$2"
     
-    echo "Mounting required filesystems for chroot..."
-    mount --bind /dev "${target_root}/dev" || { zenity --error --title="Error" --text="Failed to mount /dev"; exit 1; }
-    mount --bind /dev/pts "${target_root}/dev/pts" || { zenity --error --title="Error" --text="Failed to mount /dev/pts"; exit 1; }
-    mount -t proc proc "${target_root}/proc" || { zenity --error --title="Error" --text="Failed to mount /proc"; exit 1; }
-    mount -t sysfs sys "${target_root}/sys" || { zenity --error --title="Error" --text="Failed to mount /sys"; exit 1; }
-    mount -t tmpfs tmpfs "${target_root}/run" || { zenity --error --title="Error" --text="Failed to mount /run"; exit 1; }
+    echo "EFI Partition: $EFI_PARTITION"
+    echo "Root Partition: $ROOT_PARTITION"
     
-    [ -e "/etc/resolv.conf" ] && cp --dereference /etc/resolv.conf "${target_root}/etc/"
+    # Wait for partitions to appear in /dev
+    WAIT_SECONDS=10
+    echo "Waiting up to $WAIT_SECONDS seconds for partitions to appear..."
+    for i in $(seq 1 $WAIT_SECONDS); do
+        if [ -b "$EFI_PARTITION" ] && [ -b "$ROOT_PARTITION" ]; then
+            echo "Partitions found after $i seconds."
+            break
+        fi
+        echo "Waiting for partitions ($i/$WAIT_SECONDS)..."
+        sleep 1
+    done
     
-    cat > "${target_root}/chroot_prep.sh" << EOF
+    # Final check for partitions
+    if [ ! -b "$EFI_PARTITION" ] || [ ! -b "$ROOT_PARTITION" ]; then
+        echo "Listing available block devices:"
+        ls -la /dev/sd* /dev/nvme* /dev/mmcblk* /dev/vd* 2>/dev/null || true
+        show_error "Partitions not found after creation. Installation cannot continue."
+    fi
+    
+    # Format partitions
+    update_progress 25 "Formatting EFI partition: $EFI_PARTITION..."
+    mkfs.fat -F 32 -n "EFI-DEB" "$EFI_PARTITION" || show_error "Failed to format EFI partition"
+    
+    update_progress 30 "Formatting root partition: $ROOT_PARTITION..."
+    mkfs.ext4 -F -L "gLiTcH-Linux" "$ROOT_PARTITION" || show_error "Failed to format root partition"
+    
+    # Mount partitions
+    update_progress 35 "Mounting partitions..."
+    mkdir -p /mnt || show_error "Failed to create mount point"
+    mount "$ROOT_PARTITION" /mnt || show_error "Failed to mount root partition"
+    mkdir -p /mnt/boot/efi || show_error "Failed to create EFI directory"
+    mount "$EFI_PARTITION" /mnt/boot/efi || show_error "Failed to mount EFI partition"
+    
+    # Find squashfs file
+    update_progress 40 "Locating system image..."
+    SQUASHFS_PATHS=(
+        "/run/live/medium/live/filesystem.squashfs"
+        "/cdrom/live/filesystem.squashfs"
+        "/run/initramfs/live/filesystem.squashfs"
+        "/lib/live/mount/medium/live/filesystem.squashfs"
+        "$(find /run -name filesystem.squashfs 2>/dev/null | head -1)"
+        "$(find /cdrom -name filesystem.squashfs 2>/dev/null | head -1)"
+        "$(find /media -name filesystem.squashfs 2>/dev/null | head -1)"
+    )
+    
+    SQUASHFS_PATH=""
+    for path in "${SQUASHFS_PATHS[@]}"; do
+        if [ -f "$path" ]; then
+            SQUASHFS_PATH="$path"
+            echo "Found squashfs at: $SQUASHFS_PATH"
+            break
+        fi
+    done
+    
+    if [ -z "$SQUASHFS_PATH" ] || [ ! -f "$SQUASHFS_PATH" ]; then
+        show_error "Could not find filesystem.squashfs. Installation cannot continue."
+    fi
+    
+    # Extract system files with progress
+    update_progress 45 "Preparing to extract system files..."
+    
+    # Create a separate script to show unsquashfs progress
+    PROGRESS_SCRIPT=$(mktemp)
+    cat > "$PROGRESS_SCRIPT" << 'EOF'
 #!/bin/bash
-# Set up basic system
-echo "glitch" > /etc/hostname
-echo "127.0.1.1 glitch" >> /etc/hosts
+SQUASHFS_PATH="$1"
+MOUNT_POINT="$2"
+PROGRESS_FILE="$3"
 
-# Install required packages in chroot
-echo "Installing required packages..."
-apt-get update
-[ "$ENCRYPTED" = "yes" ] && apt-get install -y cryptsetup-initramfs cryptsetup
+# Get total number of files in squashfs
+echo "Counting files in squashfs image..." > "$PROGRESS_FILE"
+TOTAL_FILES=$(unsquashfs -l "$SQUASHFS_PATH" | grep -E '^[^0-9]+[0-9]+' | wc -l)
+echo "Total files to extract: $TOTAL_FILES" >> "$PROGRESS_FILE"
 
-# First update initramfs with proper mounts available
-echo "Updating initramfs..."
-update-initramfs -u -k all || { echo "Initramfs update failed"; exit 1; }
-
-# Then install GRUB
-echo "Installing GRUB..."
-if [ -d "/sys/firmware/efi" ]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck || { echo "EFI GRUB install failed"; exit 1; }
+# Run unsquashfs with pv if available
+if command -v pv &>/dev/null && command -v stdbuf &>/dev/null; then
+    # Advanced progress monitoring
+    unsquashfs -f -d "$MOUNT_POINT" "$SQUASHFS_PATH" 2>&1 | 
+        stdbuf -oL grep -E '^(created|extracted)' | 
+        stdbuf -oL awk -v total="$TOTAL_FILES" '{
+            count++; 
+            if (count % 100 == 0 || $0 ~ /created directory/) {
+                percent = int((count / total) * 100);
+                if (percent > 100) percent = 100;
+                if (percent < 45) percent = 45 + int(percent / 2);
+                print percent > "'"$PROGRESS_FILE"'";
+                print "Extracting: " count " of " total " files (" percent "%)..." >> "'"$PROGRESS_FILE"'";
+            }
+        }'
 else
-    grub-install ${target_device} --recheck || { echo "BIOS GRUB install failed"; exit 1; }
+    # Basic extraction without detailed progress
+    unsquashfs -f -d "$MOUNT_POINT" "$SQUASHFS_PATH" | 
+        grep -E '^(created|extracted)' | 
+        awk -v total="$TOTAL_FILES" '{
+            count++; 
+            if (count % 100 == 0) {
+                percent = int((count / total) * 100);
+                if (percent > 100) percent = 100;
+                if (percent < 45) percent = 45 + int(percent / 2);
+                print percent > "'"$PROGRESS_FILE"'";
+                print "Extracting: " count " of " total " files (" percent "%)..." >> "'"$PROGRESS_FILE"'";
+            }
+        }'
 fi
-update-grub || { echo "GRUB update failed"; exit 1; }
 
-# Verify cryptsetup in initramfs if encrypted
-if [ "$ENCRYPTED" = "yes" ]; then
-    echo "Verifying cryptsetup in initramfs..."
-    lsinitramfs /boot/initrd.img-*\$(uname -r) | grep cryptsetup || echo "Warning: cryptsetup not found in initramfs"
-fi
-
-# Clean up
-rm -f /chroot_prep.sh
+# Ensure we show 100% when done
+echo "100" > "$PROGRESS_FILE"
+echo "Extraction complete!" >> "$PROGRESS_FILE"
 EOF
-    chmod +x "${target_root}/chroot_prep.sh"
+
+    chmod +x "$PROGRESS_SCRIPT"
     
-    if zenity --question --title="Chroot Preparation" --text="Chroot environment ready! Would you like to automatically run the chroot commands now?" --width=400; then
-        (
-        echo "50" ; sleep 1
-        echo "Running chroot commands..." 
-        if ! chroot "${target_root}" /bin/bash -c "/chroot_prep.sh"; then
-            zenity --error --title="Error" --text="Chroot preparation failed!" --width=300
-            exit 1
+    # Create a temp file for progress communication
+    PROGRESS_FILE=$(mktemp)
+    
+    # Start the extraction process in background
+    update_progress 45 "Starting system extraction (this will take some time)..."
+    "$PROGRESS_SCRIPT" "$SQUASHFS_PATH" "/mnt" "$PROGRESS_FILE" &
+    EXTRACT_PID=$!
+    
+    # Monitor the progress file and update zenity progress
+    while kill -0 $EXTRACT_PID 2>/dev/null; do
+        if [ -f "$PROGRESS_FILE" ]; then
+            PERCENT=$(head -n 1 "$PROGRESS_FILE")
+            MESSAGE=$(tail -n 1 "$PROGRESS_FILE")
+            
+            # Only update if we have valid data
+            if [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+                update_progress "$PERCENT" "$MESSAGE"
+            else
+                update_progress 50 "Extracting system files..."
+            fi
+        else
+            update_progress 50 "Extracting system files..."
         fi
-        echo "100" ; sleep 1
-        ) | zenity --progress --title="Chroot Preparation" --text="Preparing..." --percentage=0 --auto-close
-        zenity --info --title="Success" --text="Chroot preparation completed successfully!" --width=300
-    else
-        zenity --info --title="Chroot Instructions" --text="You can manually run the chroot commands later with:\n\n  chroot ${target_root} /bin/bash\n  /chroot_prep.sh" --width=400
+        sleep 1
+    done
+    
+    # Check if extraction was successful
+    wait $EXTRACT_PID
+    if [ $? -ne 0 ]; then
+        show_error "Failed to extract system files"
     fi
-}
+    
+    update_progress 80 "Setting up chroot environment..."
+    mount --bind /dev /mnt/dev || show_error "Failed to bind /dev"
+    mount --bind /proc /mnt/proc || show_error "Failed to bind /proc"
+    mount --bind /sys /mnt/sys || show_error "Failed to bind /sys"
+    
+    # Update initramfs
+    update_progress 85 "Updating initramfs..."
+    chroot /mnt /bin/bash -c "update-initramfs -u -k all" || show_error "Failed to update initramfs"
+    
+    # Install GRUB
+    update_progress 90 "Installing GRUB bootloader..."
+    chroot /mnt /bin/bash -c "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Debian" || show_error "Failed to install GRUB"
+    
+    # Update GRUB
+    update_progress 93 "Updating GRUB configuration..."
+    chroot /mnt /bin/bash -c "update-grub" || show_error "Failed to update GRUB configuration"
+    
+    # Clean up
+    update_progress 97 "Cleaning up..."
+    umount /mnt/sys || echo "Warning: Failed to unmount /mnt/sys"
+    umount /mnt/proc || echo "Warning: Failed to unmount /mnt/proc"
+    umount /mnt/dev || echo "Warning: Failed to unmount /mnt/dev"
+    umount /mnt/boot/efi || echo "Warning: Failed to unmount /mnt/boot/efi"
+    umount /mnt || echo "Warning: Failed to unmount /mnt"
+    
+    # Remove temporary files
+    rm -f "$PROGRESS_FILE" "$PROGRESS_SCRIPT" "$TEMP_DISKS_FILE" "$DISK_OPTIONS_FILE"
+    
+    update_progress 100 "Installation complete!"
+} | zenity --progress --title="Installing gLiTcH Linux" --text="Preparing for installation..." --percentage=0 --auto-close --auto-kill --width=450
 
-partition_disk() {
-    local target_device="$1"
-    
-    (
-    echo "10" ; sleep 0.5
-    echo "Wiping disk..." 
-    wipefs -a "$target_device"
-    
-    echo "20" ; sleep 0.5
-    echo "Creating GPT partition table..." 
-    parted -s "$target_device" mklabel gpt
-    
-    echo "30" ; sleep 0.5
-    echo "Creating EFI partition (100MB)..." 
-    parted -s "$target_device" mkpart primary fat32 1MiB 101MiB
-    parted -s "$target_device" set 1 esp on
-    
-    echo "50" ; sleep 0.5
-    echo "Creating root partition..." 
-    parted -s "$target_device" mkpart primary ext4 101MiB 100%
-    
-    echo "60" ; sleep 0.5
-    echo "Waiting for partitions to settle..." 
-    sleep 2
-    partprobe "$target_device"
-    sleep 2
-    
-    # Determine partition names
-    if [[ "$target_device" =~ "nvme" ]]; then
-        EFI_PART="${target_device}p1"
-        ROOT_PART="${target_device}p2"
-    else
-        EFI_PART="${target_device}1"
-        ROOT_PART="${target_device}2"
-    fi
-    
-    echo "70" ; sleep 0.5
-    echo "Formatting EFI partition as FAT32..." 
-    mkfs.vfat -F32 "$EFI_PART"
-    
-    if [ "$ENCRYPTED" = "yes" ]; then
-        echo "80" ; sleep 0.5
-        echo "Setting up LUKS encryption on root partition..." 
-        cryptsetup luksFormat --type luks1 -v -y "$ROOT_PART" || { zenity --error --title="Error" --text="LUKS setup failed!"; exit 1; }
-        
-        echo "90" ; sleep 0.5
-        echo "Opening encrypted partition..." 
-        cryptsetup open "$ROOT_PART" "$LUKS_MAPPER_NAME" || { zenity --error --title="Error" --text="Failed to open LUKS partition!"; exit 1; }
-        
-        echo "95" ; sleep 0.5
-        echo "Formatting encrypted partition as ext4..." 
-        mkfs.ext4 "/dev/mapper/$LUKS_MAPPER_NAME" || { zenity --error --title="Error" --text="Failed to format encrypted partition!"; exit 1; }
-    else
-        echo "95" ; sleep 0.5
-        echo "Formatting root partition as ext4..." 
-        mkfs.ext4 "$ROOT_PART" || { zenity --error --title="Error" --text="Failed to format root partition!"; exit 1; }
-    fi
-    echo "100" ; sleep 0.5
-    ) | zenity --progress --title="Partitioning Disk" --text="Preparing..." --percentage=0 --auto-close
-}
+# Check if installation completed successfully
+if [ $? -ne 0 ]; then
+    show_error "Installation was interrupted or failed. Check the log file for details."
+fi
 
-main_install() {
-    # List available disks
-    disks_info=$(lsblk -d -o NAME,SIZE,MODEL | grep -v "NAME" | awk '{print $1 " " $2 " " $3}')
-    
-    # Get target device
-    TARGET_DEVICE=$(zenity --list --title="Select Target Device" --text="Available disks:" \
-                          --column="Device" --column="Size" --column="Model" \
-                          $(echo "$disks_info") \
-                          --width=600 --height=400)
-    [ -z "$TARGET_DEVICE" ] && exit 0
-    TARGET_DEVICE="/dev/$TARGET_DEVICE"
-    
-    if ! zenity --question --title="Warning" --text="This will ERASE ALL DATA on ${TARGET_DEVICE}!\n\nAre you sure you want to continue?" --width=400; then
-        exit 0
-    fi
-    
-    # Ask for encryption
-    ENCRYPTED=$(zenity --list --title="Encryption" --text="Enable disk encryption?" \
-                      --column="Option" --column="Description" \
-                      "yes" "Encrypt the root partition (recommended)" \
-                      "no" "No encryption" \
-                      --width=400 --height=200)
-    [ -z "$ENCRYPTED" ] && exit 0
-    
-    # Partition and format disk
-    partition_disk "$TARGET_DEVICE"
-    
-    # Mount the filesystems
-    (
-    echo "20" ; sleep 0.5
-    echo "Mounting filesystems..." 
-    mkdir -p "$TARGET_MOUNT"
-    
-    if [ "$ENCRYPTED" = "yes" ]; then
-        mount "/dev/mapper/$LUKS_MAPPER_NAME" "$TARGET_MOUNT" || { zenity --error --title="Error" --text="Failed to mount encrypted partition!"; exit 1; }
-    else
-        mount "$ROOT_PART" "$TARGET_MOUNT" || { zenity --error --title="Error" --text="Failed to mount root partition!"; exit 1; }
-    fi
-    
-    echo "40" ; sleep 0.5
-    mkdir -p "${TARGET_MOUNT}/boot/efi"
-    mount "$EFI_PART" "${TARGET_MOUNT}/boot/efi" || { zenity --error --title="Error" --text="Failed to mount EFI partition!"; exit 1; }
-    
-    echo "60" ; sleep 0.5
-    # Install system
-    echo "Creating exclude file..." 
-    create_exclude_file
-    
-    echo "80" ; sleep 0.5
-    echo "Starting rsync transfer..." 
-    rsync -aAXH --info=progress2 --exclude-from="$EXCLUDE_FILE" \
-          --exclude=/boot/efi --exclude=/boot/grub \
-          / "$TARGET_MOUNT" | pv -pet | zenity --progress --title="Copying Files" --text="Transferring system..." --percentage=0 --auto-close
-    
-    echo "90" ; sleep 0.5
-    echo "Configuring system files..." 
-    configure_system_files "$TARGET_MOUNT" "$TARGET_DEVICE"
-    
-    echo "100" ; sleep 0.5
-    ) | zenity --progress --title="Installing System" --text="Preparing..." --percentage=0 --auto-close
-    
-    prepare_chroot "$TARGET_MOUNT" "$TARGET_DEVICE"
-}
+# Show completion message
+zenity --info --title="Installation Complete" --text="gLiTcH Linux has been successfully installed on $SELECTED_DISK.\n\nYou can now reboot your system.\n\nA log file was saved to: $LOG_FILE" --width=400
 
-# Start the installation
-main_install
+exit 0
